@@ -160,6 +160,15 @@ describe('docker 管理端 会话与状态', () => {
       assert.deepEqual(body.lastApi, lastApi);
     } finally { server.closeAllConnections(); server.close(); }
   });
+
+  test('/api/state 不把结算被拒当成阻断状态（客户端继续领单）', async () => {
+    const { server, base } = await start({ runtimeBlocked: { code: 'job_not_active', jobId: 'expired-job' } });
+    try {
+      const cookie = await login(base);
+      const res = await fetch(base + '/api/state', { headers: { Cookie: cookie } });
+      assert.equal((await res.json()).runtimeBlocked, undefined);
+    } finally { server.closeAllConnections(); server.close(); }
+  });
 });
 
 describe('docker 管理端 背景静态文件', () => {

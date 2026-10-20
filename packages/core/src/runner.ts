@@ -7,7 +7,7 @@ import { JobStateMachine, type CurrentJob } from './dispatch.js';
 import { HeartbeatEngine } from './heartbeat.js';
 import { ClientLogger } from './logger.js';
 import { EventBus } from './events.js';
-import type { ApiResult, ClientType, FinishInput, FinishPayload, MePayload, NextPayload, PlatformAdapter } from './types.js';
+import type { ApiResult, ClientType, FinishInput, FinishPayload, MePayload, NextPayload, PlatformAdapter, PlaybackObservation } from './types.js';
 
 /** 播放启动结果：旧端返回 boolean；带原因的端（docker）返回 {ok,err} 供日志与 abandon 详情使用 */
 export type PlayOutcome = boolean | { ok: boolean; err?: string; attempts?: number };
@@ -42,7 +42,7 @@ export interface RuntimeDeps {
     /** 播放器停止（放弃/结算后） */
     stop(): void | Promise<void>;
     /** 订阅播放进度（接入心跳 pulse） */
-    onProgress(cb: (playedMs: number, positionMs: number, durationMs: number) => void): void;
+    onProgress(cb: (playedMs: number, positionMs: number, durationMs: number, observation?: PlaybackObservation) => void): void;
   };
   /** 轮询节奏（测试可缩短；默认：空闲 3s / 无单 30s，与 4.x 及服务端建议一致） */
   timing?: { idleMs?: number; noTargetMs?: number };
@@ -121,8 +121,14 @@ export class ClientRuntime {
         const elapsedMs = Math.max(0, now - this.jobStartedAt);
         const lastHeartbeatAgeMs = this.lastHeartbeatAt === null ? null : Math.max(0, now - this.lastHeartbeatAt);
         const lastAck = lastHeartbeatAgeMs === null ? '从未确认' : `${Math.round(lastHeartbeatAgeMs / 1000)}s 前`;
-        this.log.push('error', 'settle_failed', `${msg}；任务 ${jobId} / 领取至今 ${Math.round(elapsedMs / 1000)}s / 已确认心跳 ${this.heartbeatAcks} 次 / 最后确认 ${lastAck}`,
-          { code, jobId, elapsedMs, heartbeatAcks: this.heartbeatAcks, lastHeartbeatAgeMs });
+        // 服务端把本单判为无效（长曲常见于服务端任务期限短于目标时长）：这些单不会入账。
+        // 但不能因此停下——能正常结算的短曲会跟着一起被饿死，直到有人手动重存配置。
+        // 只累计计数，让日志把这个模式暴露出来。
+        const terminal = code === 'job_not_active' || code === 'job_expired';
+        if (terminal) this.settleRejections++;
+        const streak = terminal && this.settleRejections > 1 ? ` / 连续 ${this.settleRejections} 单被服务端判为无效` : '';
+        this.log.push('error', 'settle_failed', `${msg}；任务 ${jobId} / 领取至今 ${Math.round(elapsedMs / 1000)}s / 已确认心跳 ${this.heartbeatAcks} 次 / 最后确认 ${lastAck}${streak}`,
+          { code, jobId, elapsedMs, heartbeatAcks: this.heartbeatAcks, lastHeartbeatAgeMs, ...(terminal ? { consecutiveRejections: this.settleRejections } : {}) });
         this.bus.emit('job:phase', 'settle_failed');
       },
     }, this.bus);
@@ -142,12 +148,12 @@ export class ClientRuntime {
       onResume: () => this.log.push('info', 'hb_resume', '恢复续听'),
     });
 
-    deps.player.onProgress((playedMs, positionMs, durationMs) => {
+    deps.player.onProgress((playedMs, positionMs, durationMs, observation) => {
       if (!this.running || this.finishing || this.job.phase !== 'playing') return;
       this.job.updateProgress(playedMs);
       this.heart.update(playedMs, positionMs, durationMs); // 首个真实进度立即上报，后续按 10s 节奏
       this.trackProgress(playedMs);
-      void this.maybeFinish(positionMs, durationMs);
+      void this.maybeFinish(positionMs, durationMs, observation);
     });
 
     // UI 镜像事件
@@ -162,7 +168,9 @@ export class ClientRuntime {
   }
 
   async start(autostart: boolean): Promise<void> {
+    const generation = this.runtimeGeneration;
     await this.syncUser();
+    if (generation !== this.runtimeGeneration) return; // 等待账号同步期间发生暂停/新阻断，旧启动不能覆盖它。
     if (this.auth.status === 'valid') this.authFailed = false;
     if (autostart && this.auth.hasToken() && this.auth.status !== 'logged_out') {
       this.running = true;
@@ -207,6 +215,7 @@ export class ClientRuntime {
   }
 
   private running = false;
+  private runtimeGeneration = 0;
   private cycling = false;
   private finishing = false;
   private authFailed = false;
@@ -219,6 +228,8 @@ export class ClientRuntime {
   private lastHeartbeatAt: number | null = null;
   private heartbeatAcks = 0;
   private playRecoveryAttempts = 0;
+  /** 连续被服务端判为无效的结算次数（成功结算即归零），仅用于日志暴露模式 */
+  private settleRejections = 0;
 
   /** 卡死判定（对齐 4.x 的 playback_stalled）：播放中进度 PLAYBACK_STALL_MS 未前移 → 放弃本单，避免永久挂着 */
   private trackProgress(playedMs: number): void {
@@ -249,6 +260,7 @@ export class ClientRuntime {
 
   /** 停止主循环与心跳（进程退出/测试用；已提交的 finish 不受影响） */
   stop(): void {
+    this.runtimeGeneration++;
     this.running = false;
     if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
     this.wakeCycle?.();
@@ -327,24 +339,38 @@ export class ClientRuntime {
     void this.job.abandon('play_start_fail', detail);
   }
 
-  /** 播放完成判定：达到目标时长，或歌曲先于目标播完（避免永久卡单）→ 结算并让主循环领下一单 */
-  private async maybeFinish(positionMs: number, durationMs: number): Promise<void> {
+  /** 到达全长或真实曲终后校验最低有效播放；试听片段/提前中断不能当作完成。 */
+  private async maybeFinish(positionMs: number, durationMs: number, observation?: PlaybackObservation): Promise<void> {
     const job = this.job.current;
     if (!job || this.job.phase !== 'playing' || this.finishing || !this.running) return;
     const playedMs = job.playedMs;
     const reachedTarget = job.targetMs > 0 && playedMs >= job.targetMs;
-    const songEnded = durationMs > 0 && playedMs >= durationMs;
-    if (!reachedTarget && !songEnded) return;
+    const songEnded = observation?.ended === true
+      || (observation?.ended === undefined && durationMs > 0 && playedMs >= durationMs);
+    const requiredMs = minimumListenMs(job, durationMs);
+    // 仅真实、完整、正常速率的曲终允许小采样尾差；实际听了多少仍原样上报。
+    const toleranceMs = endSamplingTolerance(job, playedMs, positionMs, durationMs, requiredMs, observation);
+    const enoughListen = playedMs + toleranceMs >= requiredMs;
+    if (!songEnded && (!reachedTarget || !enoughListen)) return;
     this.finishing = true;
     try {
       this.heart.stop();
       await this.stopPlayer();
+      if (!enoughListen) {
+        await this.job.abandon('insufficient_playback', `音源提前结束：有效播放 ${Math.round(playedMs / 1000)}s / 最低要求 ${Math.round(requiredMs / 1000)}s（目标全长 ${Math.round(job.targetMs / 1000)}s，音源时长 ${Math.round(durationMs / 1000)}s）`);
+        return;
+      }
       const r = await this.job.submitFinish({
         jobId: job.jobId, playedMs, positionMs, durationMs,
-        playbackRate: 1, jumpCount: 0, backwardJumpCount: 0,
-        listenDriftMs: 0, recoveryAttempts: this.playRecoveryAttempts, stallDetected: false,
+        playbackRate: observation?.playbackRate ?? 1,
+        jumpCount: observation?.jumpCount ?? 0,
+        backwardJumpCount: observation?.backwardJumpCount ?? 0,
+        listenDriftMs: observation?.listenDriftMs ?? 0,
+        recoveryAttempts: this.playRecoveryAttempts,
+        stallDetected: observation?.stallDetected ?? false,
       });
       const secs = `（已播 ${Math.round(playedMs / 1000)}s / 目标 ${Math.round(job.targetMs / 1000)}s）`;
+      if (r === 'settled') this.settleRejections = 0;
       this.log.push(r === 'settled' ? 'info' : 'warn', 'job_finish', `本单结算：${r}${secs}`, { playedMs, targetMs: job.targetMs });
       if (this.running) void this.syncUser();
     } finally {
@@ -361,6 +387,30 @@ export class ClientRuntime {
     this.startSync();
     void this.cycle(); // cycle 本身防重入，重新登录仍可恢复
   }
+}
+
+function minimumListenMs(job: CurrentJob, durationMs: number): number {
+  if (job.requiredListenMs !== undefined) return job.requiredListenMs;
+  // 已知任务全长时不能使用试听片段的短时长重新降低比例门槛。
+  const fullDurationMs = job.targetMs > 0 ? job.targetMs : Number.isFinite(durationMs) && durationMs > 0 ? durationMs : 0;
+  if (job.requiredListenRatio !== undefined) return Math.ceil(fullDurationMs * job.requiredListenRatio);
+  return fullDurationMs;
+}
+
+function endSamplingTolerance(job: CurrentJob, playedMs: number, positionMs: number, durationMs: number, requiredMs: number, observation?: PlaybackObservation): number {
+  if (observation?.ended !== true || playedMs <= 0 || requiredMs <= 0) return 0;
+  const fullDurationMs = job.targetMs > 0 ? job.targetMs : durationMs;
+  if (!Number.isFinite(fullDurationMs) || fullDurationMs <= 0 || requiredMs > fullDurationMs) return 0;
+  if (!Number.isFinite(durationMs) || Math.abs(durationMs - fullDurationMs) > 5000
+      || !Number.isFinite(positionMs) || positionMs < Math.max(durationMs, fullDurationMs) - 2000
+      || positionMs > durationMs + 2000) return 0;
+  if (observation.playbackRate === undefined || !Number.isFinite(observation.playbackRate)
+      || observation.playbackRate <= 0 || observation.playbackRate > 1.05
+      || observation.jumpCount !== 0 || observation.backwardJumpCount !== 0 || observation.stallDetected !== false
+      || observation.listenDriftMs === undefined || !Number.isFinite(observation.listenDriftMs)
+      || Math.abs(observation.listenDriftMs) > 5000) return 0;
+  // 短任务也必须听够绝大部分，不能让 5s 固定容差吞掉整个任务。
+  return Math.min(5000, requiredMs * 0.01);
 }
 
 /** 播放进度停滞阈值（与 4.x 客户端一致：40s 不动判定试听卡死） */
