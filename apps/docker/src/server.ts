@@ -3,7 +3,7 @@
  * - GET /            仪表页（玻璃拟态 + 极光，深/浅主题，背景可选）
  * - GET /static/<f>  背景图片（启动时扫描静态目录建白名单，仅图片；无需登录）
  * - POST /api/login  UI_PASSWORD 登录（签发内存 session + HttpOnly Cookie）
- * - GET /api/state   状态快照（JSON）；POST /api/config 保存 Cookie/mh_ck_
+ * - GET /api/state   状态快照（JSON）；POST /api/config 保存 Cookie/客户端密钥
  */
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -115,6 +115,7 @@ export function createStatusServer({ port, state, staticDir }: { port: number; s
             configured: state.configured === true,
             acctName: state.acctName || '',
             credits: state.credits || 0,
+            neteaseUser: state.neteaseUser ?? null,
             authStatus: state.authStatus || '',
             lastApi: state.lastApi ?? null,
             jobsDone: state.jobsDone || 0,
@@ -123,7 +124,9 @@ export function createStatusServer({ port, state, staticDir }: { port: number; s
             hbIntervals: state.hbIntervals || [],
             helpUsed: state.helpUsed || 0, helpLimit: state.helpLimit ?? 9000,
             recv: state.recv || 0, recvLimit: state.recvLimit ?? 26,
+            beijingDate: state.beijingDate || '',
             logs: (state.logs || []).slice(-50),
+            servers: state.servers || [],
           })); return;
         }
         if (req.method === 'POST' && req.url === '/api/config') {

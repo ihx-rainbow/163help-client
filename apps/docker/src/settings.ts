@@ -3,11 +3,22 @@
  * 规则：
  * - 空值不覆盖已保存值（防止「只改一项」时误清另一项）；
  * - clear:true 才显式清空；
- * - key 必须是 mh_ck_ 前缀（个人中心凭证），否则拒绝，避免存进无法使用的凭证。
+ * - key 支持各服务端的凭证格式，不在管理端限制固定前缀；
+ * - 支持多服务端（servers 数组），自动剔除 API 地址末尾斜杠；
+ * - 旧版单 key 自动向前迁移并同步维护。
  */
+
+export interface ServerConfigItem {
+  id: string;
+  name: string;
+  baseUrl: string;
+  clientKey: string;
+  enabled: boolean;
+}
 
 export interface SessionConfig {
   neteaseCookie?: string;
+  servers?: ServerConfigItem[];
   clientKey?: string;
   [k: string]: unknown;
 }
@@ -15,6 +26,7 @@ export interface SessionConfig {
 export interface ConfigPatch {
   cookie?: unknown;
   key?: unknown;
+  servers?: unknown;
   clear?: unknown;
 }
 
@@ -23,24 +35,148 @@ export interface SaveResult {
   error?: string;
 }
 
-const KEY_PREFIX = 'mh_ck_';
+export function normalizeServerUrl(url: string): string {
+  if (!url || typeof url !== 'string') return '';
+  let u = url.trim().replace(/\/+$/, '');
+  // 自动剥除从浏览器地址栏复制时误带的 /portal 前端网页路由
+  u = u.replace(/\/portal\/?$/i, '');
+  return u.replace(/\/+$/, '');
+}
 
-export function applyConfigPatch(cur: SessionConfig, patch: ConfigPatch): SaveResult {
+export function migrateLegacyConfig(cur: SessionConfig, defaultBaseUrl: string = 'https://163music.linyu.qzz.io'): SessionConfig {
+  if (!cur.servers) cur.servers = [];
+  if (cur.clientKey && cur.clientKey.trim() && cur.servers.length === 0) {
+    cur.servers.push({
+      id: 'default',
+      name: '默认服务端',
+      baseUrl: normalizeServerUrl(defaultBaseUrl),
+      clientKey: cur.clientKey.trim(),
+      enabled: true,
+    });
+  }
+  return cur;
+}
+
+export function applyConfigPatch(cur: SessionConfig, patch: ConfigPatch, defaultBaseUrl?: string): SaveResult {
   if (patch && patch.clear === true) {
     delete cur.neteaseCookie;
     delete cur.clientKey;
+    cur.servers = [];
     return { saved: ['clear'] };
   }
+
   const cookie = typeof patch?.cookie === 'string' ? patch.cookie.trim() : '';
   const key = typeof patch?.key === 'string' ? patch.key.trim() : '';
-  if (!cookie && !key) {
-    return { saved: [], error: '请填写 Cookie 或客户端密钥（留空不会覆盖已保存值）' };
+
+  // 1. 全部输入校验置前，确保原子性（任何校验失败不修改 cur 对象）
+  let nextServers: ServerConfigItem[] | null = null;
+  if (Array.isArray(patch?.servers)) {
+    nextServers = [];
+    const seenIds = new Set<string>();
+    for (let i = 0; i < patch.servers.length; i++) {
+      const item = patch.servers[i];
+      if (!item || typeof item !== 'object') continue;
+      const baseUrl = normalizeServerUrl(String((item as any).baseUrl || ''));
+      let sKey = typeof (item as any).clientKey === 'string' ? (item as any).clientKey.trim() : '';
+      const name = String((item as any).name || '').trim() || `服务端 ${i + 1}`;
+      let id = String((item as any).id || '').trim();
+      if (!id) {
+        id = `srv-${Date.now()}-${i}`;
+      }
+      const enabled = (item as any).enabled !== false;
+
+      // 重复服务端 ID 去重与防护
+      if (seenIds.has(id)) {
+        if (nextServers.some((s) => s.id === id && s.baseUrl === baseUrl)) {
+          // 同一 ID 且相同 API 地址：判定为重复配置，去重跳过
+          continue;
+        }
+        // 同一 ID 但不同 API 地址：防护 ID 冲突，分配安全后缀
+        let suffix = 1;
+        let safeId = `${id}-${suffix}`;
+        while (seenIds.has(safeId)) {
+          suffix++;
+          safeId = `${id}-${suffix}`;
+        }
+        id = safeId;
+      }
+      seenIds.add(id);
+
+      if (!sKey) {
+        const existing = cur.servers?.find((s) => s.id === id);
+        if (existing?.clientKey) {
+          sKey = existing.clientKey;
+        } else if (i === 0 && cur.clientKey) {
+          sKey = cur.clientKey;
+        }
+      }
+
+      if (!baseUrl) {
+        return { saved: [], error: `第 ${i + 1} 个服务端的 API 地址不能为空` };
+      }
+      try {
+        const u = new URL(baseUrl);
+        if (!['http:', 'https:'].includes(u.protocol)) {
+          return { saved: [], error: `第 ${i + 1} 个服务端的 API 地址必须是 http 或 https 协议` };
+        }
+      } catch {
+        return { saved: [], error: `第 ${i + 1} 个服务端的 API 地址格式非法：${baseUrl}` };
+      }
+
+      nextServers.push({
+        id,
+        name,
+        baseUrl,
+        clientKey: sKey,
+        enabled,
+      });
+    }
   }
-  if (key && !key.startsWith(KEY_PREFIX)) {
-    return { saved: [], error: `客户端密钥需以 ${KEY_PREFIX} 开头（个人中心 → 凭证管理）` };
-  }
+
+  // 2. 校验通过后，初始化并迁移旧配置
+  if (!cur.servers) cur.servers = [];
+  migrateLegacyConfig(cur, defaultBaseUrl);
+
   const saved: string[] = [];
-  if (cookie && cookie !== cur.neteaseCookie) { cur.neteaseCookie = cookie; saved.push('cookie'); }
-  if (key && key !== cur.clientKey) { cur.clientKey = key; saved.push('key'); }
+
+  if (cookie && cookie !== cur.neteaseCookie) {
+    cur.neteaseCookie = cookie;
+    saved.push('cookie');
+  }
+
+  // 旧版单 key 写入兼容：如果传了 key，更新或创建 servers[0]
+  if (key) {
+    if (key !== cur.clientKey) {
+      cur.clientKey = key;
+      saved.push('key');
+    }
+    if (cur.servers.length === 0) {
+      cur.servers.push({
+        id: 'default',
+        name: '默认服务端',
+        baseUrl: normalizeServerUrl(defaultBaseUrl || 'https://163music.linyu.qzz.io'),
+        clientKey: key,
+        enabled: true,
+      });
+    } else if (cur.servers[0].clientKey !== key) {
+      cur.servers[0].clientKey = key;
+    }
+  }
+
+  // 多服务端 servers 数组写入，并双向同步维护 cur.clientKey
+  if (nextServers !== null) {
+    cur.servers = nextServers;
+    if (nextServers.length > 0 && nextServers[0].clientKey) {
+      cur.clientKey = nextServers[0].clientKey;
+    } else {
+      delete cur.clientKey;
+    }
+    if (!saved.includes('servers')) saved.push('servers');
+  }
+
+  if (saved.length === 0 && !patch?.servers && !cookie && !key) {
+    return { saved: [], error: '请填写 Cookie 或配置服务端' };
+  }
+
   return { saved };
 }
