@@ -4,8 +4,9 @@ on:
   push:
     branches:
       - main
+      - dev
     tags:
-      - 'v5*'
+      - '*'
   workflow_dispatch: {}
 
 permissions:
@@ -42,6 +43,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Get short commit SHA
+        id: commit
+        shell: bash
+        run: echo "short_sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -49,8 +55,9 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=dev,enable=${{ github.ref_name == 'dev' }}
+            type=raw,value=${{ github.ref_name }}-${{ steps.commit.outputs.short_sha }},enable=${{ github.ref_type == 'branch' }}
             type=ref,event=tag
-            type=sha
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -64,39 +71,39 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  release:
-    name: Create GitHub Release
-    needs: docker
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref_name, 'v5')
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Build release artifacts
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          bash scripts/release.sh
-          ls -l dist
-
-      - name: Create GitHub Release and upload assets
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/music-help.user.js "dist/163help-extension-v${VERSION}.zip" --clobber
-          else
-            gh release create "${GITHUB_REF_NAME}" \
-              --title "客户端 $VERSION" \
-              --notes "网易云音乐互助客户端 $VERSION（油猴/扩展；Docker 镜像见 ghcr.io/ihx-rainbow/163help-client/docker-client）" \
-              dist/music-help.user.js "dist/163help-extension-v${VERSION}.zip"
-          fi
+  # release:
+  #   name: Create GitHub Release
+  #   needs: docker
+  #   runs-on: ubuntu-latest
+  #   if: startsWith(github.ref_name, 'v5')
+  #
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Setup Node.js
+  #       uses: actions/setup-node@v4
+  #       with:
+  #         node-version: '20'
+  #
+  #     - name: Build release artifacts
+  #       shell: bash
+  #       run: |
+  #         VERSION="${GITHUB_REF_NAME#v}"
+  #         bash scripts/release.sh
+  #         ls -l dist
+  #
+  #     - name: Create GitHub Release and upload assets
+  #       shell: bash
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       run: |
+  #         VERSION="${GITHUB_REF_NAME#v}"
+  #         if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+  #           gh release upload "${GITHUB_REF_NAME}" dist/music-help.user.js "dist/163help-extension-v${VERSION}.zip" --clobber
+  #         else
+  #           gh release create "${GITHUB_REF_NAME}" \
+  #             --title "客户端 $VERSION" \
+  #             --notes "网易云音乐互助客户端 $VERSION（油猴/扩展；Docker 镜像见 ghcr.io/ihx-rainbow/163help-client/docker-client）" \
+  #             dist/music-help.user.js "dist/163help-extension-v${VERSION}.zip"
+  #         fi
